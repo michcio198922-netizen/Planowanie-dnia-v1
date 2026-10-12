@@ -22,6 +22,6 @@ module.exports = {
         backgroundColor: '#071018'
       }
     },
-    plugins: ['./plugins/withReleaseSigning']
+    plugins: ['expo-notifications', './plugins/withReleaseSigning']
   }
 };

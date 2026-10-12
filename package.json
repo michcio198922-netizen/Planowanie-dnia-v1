@@ -1,6 +1,6 @@
 {
   "name": "plan-na-jutro",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "private": true,
   "main": "index.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~57.0.21",
     "react": "19.2.3",
-    "react-native": "0.86.0"
+    "react-native": "0.86.0",
+    "expo-notifications": "~57.0.22"
   }
 }

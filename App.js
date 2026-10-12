@@ -13,8 +13,18 @@ import {
   KeyboardAvoidingView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
 
 const STORAGE_KEY = 'planNaJutro.state.v1';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 const COLORS = {
   bg: '#071018',
   card: '#0D1822',
@@ -80,6 +90,15 @@ const DAY_TEMPLATES = [
   },
 ];
 
+const CARRY_REASONS = [
+  'Brak czasu',
+  'Coś wyskoczyło',
+  'Brak energii',
+  'Zmiana priorytetów',
+  'Odkładanie',
+  'Inne',
+];
+
 const emptyTrading = () => ({
   enabled: true,
   session: 'New York',
@@ -96,6 +115,7 @@ const emptyPlan = () => ({
     { id: 'p3', text: '', done: false },
   ],
   optional: [],
+  unplanned: [],
   selfCare: { text: '', done: false },
   trading: emptyTrading(),
   avoid: '',
@@ -111,11 +131,23 @@ const emptyPlan = () => ({
     smallWins: ['', '', ''],
     carriedCount: 0,
     carryUsed: false,
+    carryReason: '',
     closedAt: null,
   },
 });
 
-const initialState = { plans: {} };
+const initialState = {
+  plans: {},
+  weeklyFocus: {},
+  settings: {
+    reminders: {
+      planEnabled: false,
+      planTime: '20:30',
+      closeEnabled: false,
+      closeTime: '21:30',
+    },
+  },
+};
 
 function pad(n) {
   return String(n).padStart(2, '0');
@@ -148,17 +180,39 @@ function weekdayLabel(key) {
   return new Date(y, m - 1, d).toLocaleDateString('pl-PL', { weekday: 'long' });
 }
 
+function weekStartKeyFromDate(date) {
+  const d = new Date(date);
+  d.setHours(12, 0, 0, 0);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return dateKey(d);
+}
+
+function weekStartKeyFromKey(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return weekStartKeyFromDate(new Date(y, m - 1, d));
+}
+
+function parseTime(value) {
+  const match = String(value || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return null;
+  return { hour: Number(match[1]), minute: Number(match[2]) };
+}
+
 function normalizePlan(plan) {
   const base = emptyPlan();
   const src = plan || {};
   const priorities = Array.isArray(src.priorities) ? src.priorities : base.priorities;
   const optional = Array.isArray(src.optional) ? src.optional : [];
+  const unplanned = Array.isArray(src.unplanned) ? src.unplanned : [];
   const wins = Array.isArray(src.close?.smallWins) ? src.close.smallWins : base.close.smallWins;
   return {
     ...base,
     ...src,
     priorities,
     optional,
+    unplanned,
     selfCare: { ...base.selfCare, ...(src.selfCare || {}) },
     trading: { ...base.trading, ...(src.trading || {}) },
     close: { ...base.close, ...(src.close || {}), smallWins: wins },
@@ -183,6 +237,7 @@ function planHasContent(plan) {
   return Boolean(
     plan.priorities?.some((x) => x.text.trim()) ||
       plan.optional?.some((x) => x.text.trim()) ||
+      plan.unplanned?.some((x) => x.text?.trim()) ||
       plan.selfCare?.text?.trim() ||
       plan.avoid?.trim() ||
       plan.note?.trim() ||
@@ -258,8 +313,12 @@ function App() {
   const [state, setState] = useState(initialState);
   const [loaded, setLoaded] = useState(false);
   const [tab, setTab] = useState('today');
+  const [newUnplanned, setNewUnplanned] = useState('');
+  const [reminderBusy, setReminderBusy] = useState(false);
   const todayKey = offsetDateKey(0);
   const tomorrowKey = offsetDateKey(1);
+  const currentWeekKey = weekStartKeyFromKey(todayKey);
+  const tomorrowWeekKey = weekStartKeyFromKey(tomorrowKey);
 
   useEffect(() => {
     (async () => {
@@ -269,7 +328,20 @@ function App() {
         const normalizedPlans = Object.fromEntries(
           Object.entries(next.plans || {}).map(([key, plan]) => [key, normalizePlan(plan)])
         );
-        next = { ...initialState, ...next, plans: normalizedPlans };
+        next = {
+          ...initialState,
+          ...next,
+          plans: normalizedPlans,
+          weeklyFocus: { ...(initialState.weeklyFocus || {}), ...(next.weeklyFocus || {}) },
+          settings: {
+            ...initialState.settings,
+            ...(next.settings || {}),
+            reminders: {
+              ...initialState.settings.reminders,
+              ...(next.settings?.reminders || {}),
+            },
+          },
+        };
         next = ensurePlan(next, todayKey);
         next = ensurePlan(next, tomorrowKey);
         setState(next);
@@ -288,6 +360,9 @@ function App() {
 
   const todayPlan = state.plans[todayKey] || emptyPlan();
   const tomorrowPlan = state.plans[tomorrowKey] || emptyPlan();
+  const currentWeeklyFocus = state.weeklyFocus?.[currentWeekKey] || '';
+  const tomorrowWeeklyFocus = state.weeklyFocus?.[tomorrowWeekKey] || '';
+  const reminderSettings = state.settings?.reminders || initialState.settings.reminders;
   const todayCompletion = completion(todayPlan);
   const streak = getPlanningStreak(state.plans);
 
@@ -315,6 +390,13 @@ function App() {
     const totalWins = closed.reduce((sum, [, p]) => sum + (p.close.smallWins || []).filter((x) => x.trim()).length, 0);
     const carryDays = closed.filter(([, p]) => p.close.carryUsed).length;
     const carriedTasks = closed.reduce((sum, [, p]) => sum + Number(p.close.carriedCount || 0), 0);
+    const unplannedCount = last7.reduce((sum, [, p]) => sum + (p?.unplanned || []).filter((x) => x.text?.trim()).length, 0);
+    const carryReasons = {};
+    closed.forEach(([, p]) => {
+      const reason = p.close?.carryReason?.trim();
+      if (p.close?.carryUsed && reason) carryReasons[reason] = (carryReasons[reason] || 0) + 1;
+    });
+    const topCarryReason = Object.entries(carryReasons).sort((a, b) => b[1] - a[1])[0] || null;
     return {
       planned: planned.length,
       closed: closed.length,
@@ -323,6 +405,8 @@ function App() {
       totalWins,
       carryDays,
       carriedTasks,
+      unplannedCount,
+      topCarryReason,
     };
   }, [state.plans, todayKey]);
 
@@ -361,6 +445,103 @@ function App() {
 
     return { bestTemplate: rank(templateMap), bestWeekday: rank(weekdayMap) };
   }, [closedHistory]);
+
+  function updateWeeklyFocus(weekKey, text) {
+    setState((prev) => ({
+      ...prev,
+      weeklyFocus: { ...(prev.weeklyFocus || {}), [weekKey]: text },
+    }));
+  }
+
+  function updateReminderSettings(patch) {
+    setState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        reminders: { ...initialState.settings.reminders, ...(prev.settings?.reminders || {}), ...patch },
+      },
+    }));
+  }
+
+  async function saveReminders() {
+    const planTime = parseTime(reminderSettings.planTime);
+    const closeTime = parseTime(reminderSettings.closeTime);
+    if (reminderSettings.planEnabled && !planTime) {
+      Alert.alert('Nieprawidłowa godzina', 'Wpisz godzinę planowania w formacie HH:MM, np. 20:30.');
+      return;
+    }
+    if (reminderSettings.closeEnabled && !closeTime) {
+      Alert.alert('Nieprawidłowa godzina', 'Wpisz godzinę zamknięcia dnia w formacie HH:MM, np. 21:30.');
+      return;
+    }
+    setReminderBusy(true);
+    try {
+      if (Platform.OS === 'android') {
+        await Notifications.setNotificationChannelAsync('plan-na-jutro', {
+          name: 'Plan na Jutro',
+          importance: Notifications.AndroidImportance.DEFAULT,
+        });
+      }
+      if (reminderSettings.planEnabled || reminderSettings.closeEnabled) {
+        const current = await Notifications.getPermissionsAsync();
+        let status = current.status;
+        if (status !== 'granted') {
+          const requested = await Notifications.requestPermissionsAsync();
+          status = requested.status;
+        }
+        if (status !== 'granted') {
+          Alert.alert('Brak zgody', 'Włącz powiadomienia dla aplikacji w ustawieniach telefonu, żeby przypomnienia działały.');
+          return;
+        }
+      }
+      await Notifications.cancelAllScheduledNotificationsAsync();
+      if (reminderSettings.planEnabled && planTime) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Plan na jutro',
+            body: 'Ustal 3 priorytety i prosty kierunek na jutro.',
+            sound: 'default',
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DAILY,
+            hour: planTime.hour,
+            minute: planTime.minute,
+            channelId: 'plan-na-jutro',
+          },
+        });
+      }
+      if (reminderSettings.closeEnabled && closeTime) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Zamknij dzień',
+            body: 'Zapisz małe zwycięstwa, wniosek i sprawdź, co przenieść.',
+            sound: 'default',
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DAILY,
+            hour: closeTime.hour,
+            minute: closeTime.minute,
+            channelId: 'plan-na-jutro',
+          },
+        });
+      }
+      Alert.alert('Gotowe', reminderSettings.planEnabled || reminderSettings.closeEnabled ? 'Przypomnienia zostały ustawione.' : 'Przypomnienia zostały wyłączone.');
+    } catch (e) {
+      Alert.alert('Błąd', 'Nie udało się ustawić przypomnień. Spróbuj ponownie po ponownym uruchomieniu aplikacji.');
+    } finally {
+      setReminderBusy(false);
+    }
+  }
+
+  function addUnplanned() {
+    const text = newUnplanned.trim();
+    if (!text) return;
+    updatePlan(todayKey, (plan) => {
+      plan.unplanned.push({ id: `u_${Date.now()}`, text });
+      return plan;
+    });
+    setNewUnplanned('');
+  }
 
   function updatePlan(key, updater) {
     setState((prev) => {
@@ -419,6 +600,10 @@ function App() {
     }
     if (!unfinished.length) {
       Alert.alert('Nic do przeniesienia', 'Wszystkie zapisane rzeczy są już zrobione.');
+      return;
+    }
+    if (!todayPlan.close.carryReason?.trim()) {
+      Alert.alert('Powód przeniesienia', 'Najpierw wybierz powód przeniesienia zadań. To pomoże zobaczyć, co najczęściej rozwala plan.');
       return;
     }
     updatePlan(tomorrowKey, (plan) => {
@@ -491,6 +676,13 @@ function App() {
 
         {todayPlan.templateLabel ? (
           <View style={styles.templateBadge}><Text style={styles.templateBadgeText}>{todayPlan.templateLabel.toUpperCase()}</Text></View>
+        ) : null}
+
+        {currentWeeklyFocus.trim() ? (
+          <Card style={styles.focusCard}>
+            <Text style={styles.focusKicker}>FOCUS TYGODNIA</Text>
+            <Text style={styles.focusText}>{currentWeeklyFocus}</Text>
+          </Card>
         ) : null}
 
         {todayPlan.note?.trim() ? (
@@ -567,6 +759,31 @@ function App() {
               </>
             ) : null}
 
+            <SectionTitle title="Wyskoczyło w ciągu dnia" subtitle="Zapisz rzeczy, których nie planowałeś, ale musiałeś się nimi zająć. To daje kontekst, gdy plan nie wyjdzie w 100%." />
+            <Card>
+              {(todayPlan.unplanned || []).map((item, idx) => (
+                <View key={item.id || idx} style={styles.unplannedRow}>
+                  <Text style={styles.unplannedText}>• {item.text}</Text>
+                  <TouchableOpacity style={styles.smallRemoveButton} onPress={() => updatePlan(todayKey, (plan) => {
+                    plan.unplanned.splice(idx, 1);
+                    return plan;
+                  })}><Text style={styles.smallRemoveText}>×</Text></TouchableOpacity>
+                </View>
+              ))}
+              <View style={styles.quickAddRow}>
+                <TextInput
+                  value={newUnplanned}
+                  onChangeText={setNewUnplanned}
+                  placeholder="np. telefon ze szkoły / sprawa rodzinna / awaria"
+                  placeholderTextColor="#607384"
+                  style={[styles.input, { flex: 1, marginBottom: 0 }]}
+                  returnKeyType="done"
+                  onSubmitEditing={addUnplanned}
+                />
+                <TouchableOpacity style={styles.quickAddButton} onPress={addUnplanned}><Text style={styles.quickAddButtonText}>+</Text></TouchableOpacity>
+              </View>
+            </Card>
+
             <TouchableOpacity style={styles.secondaryButton} onPress={() => setTab('close')}>
               <Text style={styles.secondaryButtonText}>ZAMKNIJ DZIEŃ</Text>
             </TouchableOpacity>
@@ -583,6 +800,23 @@ function App() {
         <Text style={styles.eyebrow}>PLAN NA JUTRO</Text>
         <Text style={styles.title}>{prettyDate(tomorrowKey)}</Text>
         <Text style={styles.lead}>Priorytety zamiast godzin. Jeśli coś wyskoczy, zmieniasz kolejność — nie uznajesz dnia za przegrany.</Text>
+
+        <SectionTitle title="Focus tygodnia" subtitle="Jedno zdanie na cały tydzień. Ma przypominać, na czym naprawdę chcesz się skupić." />
+        <Card style={styles.focusCard}>
+          <TextInput
+            value={tomorrowWeeklyFocus}
+            onChangeText={(text) => updateWeeklyFocus(tomorrowWeekKey, text)}
+            placeholder="np. zero revenge trade / mniej telefonu / sen + trening / proces > wynik"
+            placeholderTextColor="#607384"
+            style={[styles.input, styles.multiline]}
+            multiline
+          />
+          <View style={styles.pillWrap}>
+            {['Zero revenge trade', 'Proces > wynik', 'Mniej telefonu', 'Sen + trening'].map((focus) => (
+              <Pill key={focus} label={focus} active={tomorrowWeeklyFocus === focus} onPress={() => updateWeeklyFocus(tomorrowWeekKey, focus)} />
+            ))}
+          </View>
+        </Card>
 
         <SectionTitle title="Szablon dnia" subtitle="Kliknij, żeby szybko ustawić ramy. Wszystko możesz potem zmienić." />
         <Card>
@@ -738,6 +972,52 @@ function App() {
           </TouchableOpacity>
         </Card>
 
+        <SectionTitle title="Przypomnienia" subtitle="Ustaw własne godziny. Możesz mieć jedno albo dwa przypomnienia dziennie." />
+        <Card>
+          <View style={styles.reminderHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.cardTitle}>Zaplanuj jutro</Text>
+              <Text style={styles.bodyMuted}>Wieczorne przypomnienie, żeby zrobić plan na kolejny dzień.</Text>
+            </View>
+            <TouchableOpacity style={[styles.toggleButton, reminderSettings.planEnabled && styles.toggleButtonOn]} onPress={() => updateReminderSettings({ planEnabled: !reminderSettings.planEnabled })}>
+              <Text style={[styles.toggleText, reminderSettings.planEnabled && styles.toggleTextOn]}>{reminderSettings.planEnabled ? 'WŁ.' : 'WYŁ.'}</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.inputLabel}>GODZINA</Text>
+          <TextInput
+            value={reminderSettings.planTime}
+            onChangeText={(text) => updateReminderSettings({ planTime: text })}
+            placeholder="20:30"
+            placeholderTextColor="#607384"
+            style={styles.input}
+            keyboardType="numbers-and-punctuation"
+            maxLength={5}
+          />
+
+          <View style={[styles.reminderHeader, { marginTop: 8 }]}> 
+            <View style={{ flex: 1 }}>
+              <Text style={styles.cardTitle}>Zamknij dzień</Text>
+              <Text style={styles.bodyMuted}>Przypomnienie o małych zwycięstwach i krótkim review.</Text>
+            </View>
+            <TouchableOpacity style={[styles.toggleButton, reminderSettings.closeEnabled && styles.toggleButtonOn]} onPress={() => updateReminderSettings({ closeEnabled: !reminderSettings.closeEnabled })}>
+              <Text style={[styles.toggleText, reminderSettings.closeEnabled && styles.toggleTextOn]}>{reminderSettings.closeEnabled ? 'WŁ.' : 'WYŁ.'}</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.inputLabel}>GODZINA</Text>
+          <TextInput
+            value={reminderSettings.closeTime}
+            onChangeText={(text) => updateReminderSettings({ closeTime: text })}
+            placeholder="21:30"
+            placeholderTextColor="#607384"
+            style={styles.input}
+            keyboardType="numbers-and-punctuation"
+            maxLength={5}
+          />
+          <TouchableOpacity style={styles.secondaryButton} disabled={reminderBusy} onPress={saveReminders}>
+            <Text style={styles.secondaryButtonText}>{reminderBusy ? 'ZAPISUJĘ…' : 'ZAPISZ PRZYPOMNIENIA'}</Text>
+          </TouchableOpacity>
+        </Card>
+
         <TouchableOpacity style={styles.primaryButton} onPress={saveTomorrow}>
           <Text style={styles.primaryButtonText}>ZAPISZ PLAN NA JUTRO</Text>
         </TouchableOpacity>
@@ -795,6 +1075,15 @@ function App() {
           <TextInput value={todayPlan.close.repeat} onChangeText={(text) => updatePlan(todayKey, (plan) => { plan.close.repeat = text; return plan; })} placeholder="Jedna dobra rzecz do utrzymania" placeholderTextColor="#607384" style={[styles.input, styles.multiline]} multiline />
         </Card>
 
+        <SectionTitle title="Jeśli coś przenosisz — dlaczego?" subtitle="Nie po to, żeby się oceniać. Po to, żeby zobaczyć powtarzający się problem." />
+        <Card>
+          <View style={styles.pillWrap}>
+            {CARRY_REASONS.map((reason) => (
+              <Pill key={reason} label={reason} active={todayPlan.close.carryReason === reason} onPress={() => updatePlan(todayKey, (plan) => { plan.close.carryReason = reason; return plan; })} />
+            ))}
+          </View>
+        </Card>
+
         <TouchableOpacity style={styles.secondaryButton} onPress={carryUnfinished}>
           <Text style={styles.secondaryButtonText}>PRZENIEŚ NIEZROBIONE NA JUTRO</Text>
         </TouchableOpacity>
@@ -824,8 +1113,17 @@ function App() {
         <Card>
           <View style={styles.infoRow}><Text style={styles.infoLabel}>Zamknięte dni</Text><Text style={styles.infoValue}>{weekStats.closed}/7</Text></View>
           <View style={styles.infoRow}><Text style={styles.infoLabel}>Dni z przeniesieniem</Text><Text style={styles.infoValue}>{weekStats.carryDays}</Text></View>
-          <View style={[styles.infoRow, { borderBottomWidth: 0 }]}><Text style={styles.infoLabel}>Przeniesione zadania</Text><Text style={styles.infoValue}>{weekStats.carriedTasks}</Text></View>
+          <View style={styles.infoRow}><Text style={styles.infoLabel}>Przeniesione zadania</Text><Text style={styles.infoValue}>{weekStats.carriedTasks}</Text></View>
+          <View style={styles.infoRow}><Text style={styles.infoLabel}>Rzeczy, które wyskoczyły</Text><Text style={styles.infoValue}>{weekStats.unplannedCount}</Text></View>
+          <View style={[styles.infoRow, { borderBottomWidth: 0 }]}><Text style={styles.infoLabel}>Najczęstszy powód</Text><Text style={styles.infoValue}>{weekStats.topCarryReason ? `${weekStats.topCarryReason[0]} (${weekStats.topCarryReason[1]})` : '—'}</Text></View>
         </Card>
+
+        {currentWeeklyFocus.trim() ? (
+          <Card style={styles.focusCard}>
+            <Text style={styles.focusKicker}>FOCUS TEGO TYGODNIA</Text>
+            <Text style={styles.focusText}>{currentWeeklyFocus}</Text>
+          </Card>
+        ) : null}
 
         <SectionTitle title="Najlepsze dni" subtitle="Aplikacja szuka, przy jakim typie dnia i w jaki dzień tygodnia idzie Ci najlepiej." />
         <View style={styles.metricsRow}>
@@ -858,6 +1156,11 @@ function App() {
                 <Text style={[styles.inputLabel, { marginTop: 12 }]}>MAŁE ZWYCIĘSTWA</Text>
                 {wins.map((w, idx) => <Text key={idx} style={styles.winLine}>• {w}</Text>)}
               </> : null}
+              {(plan.unplanned || []).filter((x) => x.text?.trim()).length ? <>
+                <Text style={[styles.inputLabel, { marginTop: 12 }]}>WYSKOCZYŁO W CIĄGU DNIA</Text>
+                {(plan.unplanned || []).filter((x) => x.text?.trim()).map((x, idx) => <Text key={x.id || idx} style={styles.winLine}>• {x.text}</Text>)}
+              </> : null}
+              {plan.close.carryUsed && plan.close.carryReason?.trim() ? <Text style={styles.historyNote}><Text style={styles.historyNoteLabel}>Powód przeniesienia: </Text>{plan.close.carryReason}</Text> : null}
               {plan.close.improve?.trim() ? <Text style={styles.historyNote}><Text style={styles.historyNoteLabel}>Wniosek: </Text>{plan.close.improve}</Text> : null}
             </Card>
           );
@@ -963,6 +1266,21 @@ const styles = StyleSheet.create({
   avoidKicker: { color: COLORS.amber, fontSize: 11, fontWeight: '900', letterSpacing: 1.2, marginBottom: 7 },
   avoidText: { color: '#F7E5BF', fontSize: 16, lineHeight: 23, fontWeight: '700' },
   insightValue: { color: COLORS.text, fontSize: 18, lineHeight: 23, fontWeight: '900' },
+  focusCard: { borderColor: '#2D5964', backgroundColor: '#0B2229' },
+  focusKicker: { color: COLORS.cyan, fontSize: 11, fontWeight: '900', letterSpacing: 1.2, marginBottom: 7 },
+  focusText: { color: '#E3FBFF', fontSize: 17, lineHeight: 24, fontWeight: '800' },
+  unplannedRow: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: '#172735', paddingVertical: 8, gap: 8 },
+  unplannedText: { color: COLORS.text, fontSize: 14, lineHeight: 20, flex: 1 },
+  smallRemoveButton: { width: 30, height: 30, borderRadius: 9, backgroundColor: '#2A1620', alignItems: 'center', justifyContent: 'center' },
+  smallRemoveText: { color: COLORS.red, fontSize: 20, fontWeight: '800', marginTop: -2 },
+  quickAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
+  quickAddButton: { width: 46, height: 46, borderRadius: 12, backgroundColor: COLORS.blue, alignItems: 'center', justifyContent: 'center' },
+  quickAddButtonText: { color: '#FFFFFF', fontSize: 26, fontWeight: '900', marginTop: -2 },
+  reminderHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 10 },
+  toggleButton: { minWidth: 54, paddingHorizontal: 10, paddingVertical: 9, borderRadius: 999, backgroundColor: '#182632', borderWidth: 1, borderColor: COLORS.border, alignItems: 'center' },
+  toggleButtonOn: { backgroundColor: '#14382C', borderColor: COLORS.green },
+  toggleText: { color: COLORS.muted, fontSize: 11, fontWeight: '900' },
+  toggleTextOn: { color: '#CBF8E5' },
   nav: { flexDirection: 'row', backgroundColor: '#09131C', borderTopWidth: 1, borderTopColor: COLORS.border, paddingBottom: Platform.OS === 'android' ? 8 : 4, paddingTop: 8 },
   navItem: { flex: 1, alignItems: 'center', justifyContent: 'center', minHeight: 48 },
   navDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: '#314353', marginBottom: 5 },
